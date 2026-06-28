@@ -1,0 +1,576 @@
+hook.remove("render", "mirror_movement")
+gui.remove("Mirror Movement")
+
+local KEY_TARGET = 0x54 -- T
+local KEY_ACTIVE = 0x48 -- H
+local KEY_SPRINT = 0xA0 -- Left Shift
+
+local W, A, S, D, SPACE = 0x57, 0x41, 0x53, 0x44, 0x20
+
+local DEADZONE = 0.38       -- 8-way boundary (cos 67.5)
+local STOP_SPEED = 2.0      -- velocity-fallback floor only
+local MOVE_MIN = 0.05
+local JUMP_HOLD_MS = 120
+local JUMP_VELOCITY = 8
+local MAX_DELAY_MS = 10000
+local RING_RADIUS = 2.5
+local RING_SEGMENTS = 28
+local MARKER = color(1, 0.15, 0.15, 1)
+local WHITE = color(1, 1, 1, 1)
+
+local FROZEN_STATES = {
+    [humanoid_state.FALLING_DOWN]      = true,
+    [humanoid_state.RAGDOLL]           = true,
+    [humanoid_state.GETTING_UP]        = true,
+    [humanoid_state.SEATED]            = true,
+    [humanoid_state.PLATFORM_STANDING] = true,
+    [humanoid_state.DEAD]              = true,
+    [humanoid_state.PHYSICS]           = true,
+}
+
+input.simulate_press_up(W)
+input.simulate_press_up(A)
+input.simulate_press_up(S)
+input.simulate_press_up(D)
+input.simulate_press_up(SPACE)
+input.simulate_press_up(KEY_SPRINT)
+
+local menu = gui.create("Mirror Movement", false)
+menu:set_size(340, 1000)
+
+menu:add_label("Get Target")
+menu:add_keybind("Target Key", KEY_TARGET)
+local get_target_mode = menu:add_combo("Target Mode", { "Hold", "Toggle" }, 1)
+
+menu:add_label("Active Mirror")
+menu:add_keybind("Mirror Key", KEY_ACTIVE)
+local active_mode = menu:add_combo("Mirror Mode", { "Hold", "Toggle" }, 0)
+
+local target_type = menu:add_combo("Target Type", { "Nearest Cursor", "Nearest Distance" }, 0)
+local ignore_friends = menu:add_checkbox("Ignore Friends", true)
+
+menu:add_label("View")
+local show_view = menu:add_checkbox("View Target", true)
+local view_type = menu:add_combo("View Type", { "Bottom Circle", "Top Circle", "Box" }, 0)
+local show_speed = menu:add_checkbox("Show Speed", false)
+
+menu:add_label("Movement")
+local invert = menu:add_checkbox("Invert Movement", false)
+local velocity_fallback = menu:add_checkbox("Velocity Fallback", false)
+
+local use_forward = menu:add_checkbox("Forward", true)
+local d_fwd = menu:add_slider("Forward Delay", 0, 10, 0)
+local use_back = menu:add_checkbox("Backward", true)
+local d_back = menu:add_slider("Backward Delay", 0, 10, 0)
+local use_left = menu:add_checkbox("Left", true)
+local d_left = menu:add_slider("Left Delay", 0, 10, 0)
+local use_right = menu:add_checkbox("Right", true)
+local d_right = menu:add_slider("Right Delay", 0, 10, 0)
+local use_jump = menu:add_checkbox("Jump", true)
+local d_jump = menu:add_slider("Jump Delay", 0, 10, 0)
+
+menu:add_label("Da Hood")
+local match_sprint = menu:add_checkbox("Match Sprint  [Da Hood only]", false)
+menu:add_keybind("Sprint Key", KEY_SPRINT)
+local sprint_speed = menu:add_slider("Sprint Speed", 0, 50, 24)
+local match_move_speed = menu:add_checkbox("Match Move Speed  [Da Hood only]", false)
+
+local held = {
+    [W] = false, [A] = false, [S] = false, [D] = false,
+    [SPACE] = false, [KEY_SPRINT] = false
+}
+
+local locked_target = nil
+local target_hold_down = false
+local target_toggled = false
+local active_toggled = false
+local last_get_mode = get_target_mode:get_value()
+local last_active_mode = active_mode:get_value()
+
+local history = {}
+local hist_head = 1
+local prev_delayed_jump = false
+local jump_until = 0
+local saved_ws = nil
+
+local function valid(inst)
+    return inst and inst:isvalid()
+end
+
+local function flat_mag(x, z)
+    return math.sqrt((x * x) + (z * z))
+end
+
+local function round1(n)
+    return math.floor((n * 10) + 0.5) / 10
+end
+
+local function dot3(a, b)
+    if not a or not b then return 0 end
+    return ((a.x or 0) * (b.x or 0)) + ((a.y or 0) * (b.y or 0)) + ((a.z or 0) * (b.z or 0))
+end
+
+local function dist2(a, b)
+    local x = (a.x or 0) - (b.x or 0)
+    local y = (a.y or 0) - (b.y or 0)
+    return math.sqrt((x * x) + (y * y))
+end
+
+local function dist3(a, b)
+    local x = (a.x or 0) - (b.x or 0)
+    local y = (a.y or 0) - (b.y or 0)
+    local z = (a.z or 0) - (b.z or 0)
+    return math.sqrt((x * x) + (y * y) + (z * z))
+end
+
+local function add_y(v, y)
+    return vector3(v.x, v.y + y, v.z)
+end
+
+local function get_velocity(part)
+    if not valid(part) then return nil end
+    local v = part.linear_velocity
+    if v and (v.x or v.y or v.z) then return v end
+    return part.velocity
+end
+
+local function value_bool(parent, name)
+    local v = valid(parent) and parent:find_first_child(name) or nil
+    return valid(v) and v:get_value_bool() == true
+end
+
+local function dahood_frozen(char)
+    if not valid(char) then return false end
+    local fx = char:find_first_child("BodyEffects")
+    if not valid(fx) then return false end
+    if value_bool(fx, "Cuff") then return true end
+    if value_bool(fx, "K.O") then return true end
+    if value_bool(fx, "Dead") then return true end
+    local grabbed = fx:find_first_child("Grabbed")
+    if valid(grabbed) and valid(grabbed:get_value_object()) then return true end
+    return false
+end
+
+local function dahood_air(char)
+    return value_bool(char, "Air")
+end
+
+local function is_frozen(data)
+    if FROZEN_STATES[data.humanoid:get_state()] then return true end
+    return dahood_frozen(data.character)
+end
+
+local function slider_ms(slider)
+    local v = slider:get_value() or 0
+    if v < 0 then v = 0 end
+    if v > 10 then v = 10 end
+    v = math.floor((v * 10) + 0.5) / 10
+    return math.floor((v * 1000) + 0.5)
+end
+
+local function set_key(key, state)
+    if held[key] == state then return end
+    held[key] = state
+    if state then
+        input.simulate_press_down(key)
+    else
+        input.simulate_press_up(key)
+    end
+end
+
+local function clear_history()
+    history = {}
+    hist_head = 1
+    prev_delayed_jump = false
+    jump_until = 0
+end
+
+local function get_local_player()
+    local players = game:get_service("Players")
+    if not valid(players) then return nil end
+    return players.local_player
+end
+
+local function local_humanoid()
+    local lp = get_local_player()
+    if not valid(lp) or not valid(lp.character) then return nil end
+    return lp.character:find_first_child_class("Humanoid")
+end
+
+local function restore_walkspeed()
+    if saved_ws then
+        local hum = local_humanoid()
+        if valid(hum) then hum:set_walkspeed(saved_ws) end
+        saved_ws = nil
+    end
+end
+
+local function release_keys()
+    set_key(W, false)
+    set_key(A, false)
+    set_key(S, false)
+    set_key(D, false)
+    set_key(SPACE, false)
+    set_key(KEY_SPRINT, false)
+end
+
+local function stop_motion()
+    clear_history()
+    release_keys()
+    restore_walkspeed()
+end
+
+local function get_root(char)
+    if not valid(char) then return nil end
+    return char:find_first_child("HumanoidRootPart")
+        or char:find_first_child("Torso")
+        or char:find_first_child("Head")
+end
+
+local function get_camera_basis()
+    local workspace = game:get_service("Workspace")
+    local cam = valid(workspace) and workspace:find_first_child_class("Camera") or nil
+    local look = valid(cam) and cam.camera_lookvector or nil
+
+    if not look then
+        return { x = 0, y = 0, z = -1 }, { x = 1, y = 0, z = 0 }
+    end
+
+    local x = look.x or 0
+    local z = look.z or -1
+    local mag = flat_mag(x, z)
+
+    if mag < 0.001 then
+        return { x = 0, y = 0, z = -1 }, { x = 1, y = 0, z = 0 }
+    end
+
+    local forward = { x = x / mag, y = 0, z = z / mag }
+    local right = { x = -forward.z, y = 0, z = forward.x }
+    return forward, right
+end
+
+local function get_target_data(plr)
+    local lp = get_local_player()
+    if not valid(plr) or not valid(lp) then return nil end
+    if plr.identity == lp.identity then return nil end
+
+    local info = get_cached_playerinfo(plr)
+    if info then
+        if info.same_team then return nil end
+        if ignore_friends:get_value() and info.is_friend then return nil end
+    end
+
+    local char = info and info.character or plr.character
+    if not valid(char) then return nil end
+
+    local hum = char:find_first_child_class("Humanoid")
+    local root = get_root(char)
+    if not valid(hum) or not valid(root) then return nil end
+    if hum.health <= 0 then return nil end
+
+    return { player = plr, character = char, humanoid = hum, root = root }
+end
+
+local function nearest_cursor()
+    local players = get_players()
+    if not players then return nil end
+    local mouse = input.get_mouse_position()
+    local best, best_dist = nil, math.huge
+    for _, plr in pairs(players) do
+        local data = get_target_data(plr)
+        if data then
+            local pos = world_to_screen(data.root.position)
+            if in_screen(pos) then
+                local d = dist2(mouse, pos)
+                if d < best_dist then best_dist = d; best = data end
+            end
+        end
+    end
+    return best
+end
+
+local function nearest_distance()
+    local players = get_players()
+    if not players then return nil end
+    local lp = get_local_player()
+    local localroot = valid(lp) and get_root(lp.character) or nil
+    if not valid(localroot) then return nil end
+    local best, best_dist = nil, math.huge
+    for _, plr in pairs(players) do
+        local data = get_target_data(plr)
+        if data then
+            local d = dist3(localroot.position, data.root.position)
+            if d < best_dist then best_dist = d; best = data end
+        end
+    end
+    return best
+end
+
+local function find_target()
+    if target_type:get_value() == 0 then return nearest_cursor() end
+    return nearest_distance()
+end
+
+local function same_target(a, b)
+    return a and b and a.player and b.player and a.player.identity == b.player.identity
+end
+
+local function set_target(data)
+    if not same_target(locked_target, data) then stop_motion() end
+    locked_target = data
+end
+
+local function update_target()
+    local mode = get_target_mode:get_value()
+    if mode ~= last_get_mode then
+        target_toggled = false
+        target_hold_down = false
+        set_target(nil)
+        last_get_mode = mode
+    end
+
+    if mode == 0 then
+        local down = input.key_down(KEY_TARGET)
+        if down and not target_hold_down then set_target(find_target()) end
+        if not down and target_hold_down then set_target(nil) end
+        target_hold_down = down
+    else
+        if input.is_key_pressed(KEY_TARGET) then
+            if target_toggled then
+                target_toggled = false
+                set_target(nil)
+            else
+                local found = find_target()
+                if found then target_toggled = true; set_target(found) end
+            end
+        end
+    end
+
+    if locked_target then
+        local fresh = get_target_data(locked_target.player)
+        if fresh then
+            locked_target = fresh
+        else
+            target_toggled = false
+            set_target(nil)
+        end
+    end
+end
+
+local function mirror_active()
+    local mode = active_mode:get_value()
+    if mode ~= last_active_mode then
+        active_toggled = false
+        stop_motion()
+        last_active_mode = mode
+    end
+    if mode == 0 then return input.key_down(KEY_ACTIVE) end
+    if input.is_key_pressed(KEY_ACTIVE) then
+        active_toggled = not active_toggled
+        if not active_toggled then stop_motion() end
+    end
+    return active_toggled
+end
+
+-- 3D ground/head ring, projected per-point
+local function draw_ring(center, radius)
+    local prev_sp, prev_on = nil, false
+    for i = 0, RING_SEGMENTS do
+        local ang = (i / RING_SEGMENTS) * math.pi * 2
+        local wp = vector3(center.x + math.cos(ang) * radius, center.y, center.z + math.sin(ang) * radius)
+        local sp = world_to_screen(wp)
+        local on = in_screen(sp)
+        if prev_sp and prev_on and on then
+            render.add_line(prev_sp, sp, MARKER, 2)
+        end
+        prev_sp, prev_on = sp, on
+    end
+end
+
+local function draw_target(data)
+    if not show_view:get_value() or not data then return end
+    local base = data.root.position
+    local mode = view_type:get_value()
+
+    if mode == 0 then
+        draw_ring(add_y(base, -3), RING_RADIUS)
+    elseif mode == 1 then
+        draw_ring(add_y(base, 3), RING_RADIUS)
+    else
+        local top = world_to_screen(add_y(base, 3))
+        local bottom = world_to_screen(add_y(base, -3))
+        if not in_screen(top) or not in_screen(bottom) then return end
+        local y1, y2 = top.y, bottom.y
+        if y1 > y2 then y1, y2 = y2, y1 end
+        local h = y2 - y1
+        local w = math.max(20, h * 0.45)
+        local x = (top.x + bottom.x) / 2
+        render.add_rect(vector2(x - w / 2, y1), vector2(x + w / 2, y2), MARKER, 0, 2)
+    end
+end
+
+local function draw_speed(data)
+    if not show_speed:get_value() or not data then return end
+    local vel = get_velocity(data.root)
+    local speed = vel and flat_mag(vel.x or 0, vel.z or 0) or 0
+    local ws = data.humanoid.walkspeed or 0
+    local sp = world_to_screen(add_y(data.root.position, 4))
+    if in_screen(sp) then
+        render.add_text(sp, "spd " .. round1(speed) .. "   ws " .. round1(ws), WHITE)
+    end
+end
+
+-- capture the target's intended camera-relative key state for this frame
+local function capture_intent(data)
+    if is_frozen(data) then
+        return { f = false, b = false, l = false, r = false, j = false }
+    end
+
+    local state = data.humanoid:get_state()
+    local dir = data.humanoid.move_direction
+    local vel = get_velocity(data.root)
+
+    local vx = vel and (vel.x or 0) or 0
+    local vy = vel and (vel.y or 0) or 0
+    local vz = vel and (vel.z or 0) or 0
+    local speed = flat_mag(vx, vz)
+
+    local mx = dir and (dir.x or 0) or 0
+    local mz = dir and (dir.z or 0) or 0
+    local mmag = flat_mag(mx, mz)
+
+    local dx, dz = 0, 0
+    if mmag > MOVE_MIN then
+        dx = mx / mmag
+        dz = mz / mmag
+    elseif velocity_fallback:get_value() and speed >= STOP_SPEED then
+        dx = vx / speed
+        dz = vz / speed
+    end
+
+    local fwd_amt, right_amt = 0, 0
+    if dx ~= 0 or dz ~= 0 then
+        local fb, rb = get_camera_basis()
+        local move = { x = dx, y = 0, z = dz }
+        fwd_amt = dot3(move, fb)
+        right_amt = dot3(move, rb)
+        if invert:get_value() then
+            fwd_amt = -fwd_amt
+            right_amt = -right_amt
+        end
+    end
+
+    local jumping = (state == humanoid_state.JUMPING)
+        or (vy > JUMP_VELOCITY)
+        or (dahood_air(data.character) and vy > 0)
+
+    return {
+        f = fwd_amt > DEADZONE,
+        b = fwd_amt < -DEADZONE,
+        r = right_amt > DEADZONE,
+        l = right_amt < -DEADZONE,
+        j = jumping
+    }
+end
+
+local function push_sample(now, s)
+    s.t = now
+    history[#history + 1] = s
+end
+
+local function prune(now)
+    local cutoff = now - (MAX_DELAY_MS + 1000)
+    while hist_head <= #history and history[hist_head].t < cutoff do
+        hist_head = hist_head + 1
+    end
+    if hist_head > 256 then
+        local nh = {}
+        for i = hist_head, #history do nh[#nh + 1] = history[i] end
+        history = nh
+        hist_head = 1
+    end
+end
+
+-- newest sample at or before (now - delay)
+local function sample_at(now, ms)
+    local target_t = now - ms
+    for i = #history, hist_head, -1 do
+        if history[i].t <= target_t then return history[i] end
+    end
+    return nil
+end
+
+local function want(enabled, s, field)
+    return enabled and s ~= nil and s[field] == true
+end
+
+local function output_keys(now)
+    local sf = sample_at(now, slider_ms(d_fwd))
+    local sb = sample_at(now, slider_ms(d_back))
+    local sl = sample_at(now, slider_ms(d_left))
+    local sr = sample_at(now, slider_ms(d_right))
+    local sj = sample_at(now, slider_ms(d_jump))
+
+    set_key(W, want(use_forward:get_value(), sf, "f"))
+    set_key(S, want(use_back:get_value(), sb, "b"))
+    set_key(A, want(use_left:get_value(), sl, "l"))
+    set_key(D, want(use_right:get_value(), sr, "r"))
+
+    local dj = (sj ~= nil and sj.j == true)
+    if dj and not prev_delayed_jump then
+        jump_until = now + JUMP_HOLD_MS
+    end
+    prev_delayed_jump = dj
+    set_key(SPACE, use_jump:get_value() and now < jump_until)
+end
+
+local function update_sprint(data)
+    if not match_sprint:get_value() or is_frozen(data) then
+        set_key(KEY_SPRINT, false)
+        return
+    end
+    local vel = get_velocity(data.root)
+    local speed = vel and flat_mag(vel.x or 0, vel.z or 0) or 0
+    set_key(KEY_SPRINT, speed >= (sprint_speed:get_value() or 24))
+end
+
+local function update_movespeed(data)
+    if not match_move_speed:get_value() then
+        restore_walkspeed()
+        return
+    end
+    local hum = local_humanoid()
+    if not valid(hum) then return end
+    local tws = data.humanoid.walkspeed
+    if not tws then return end
+    if not saved_ws then saved_ws = hum.walkspeed end
+    hum:set_walkspeed(tws)
+end
+
+local function mirror(data)
+    update_sprint(data)
+    update_movespeed(data)
+
+    local now = get_tickcount()
+    push_sample(now, capture_intent(data))
+    prune(now)
+    output_keys(now)
+end
+
+hook.add("render", "mirror_movement", function()
+    if not is_gamefocused() then
+        stop_motion()
+        return
+    end
+
+    update_target()
+    draw_target(locked_target)
+    draw_speed(locked_target)
+
+    if not locked_target or not mirror_active() then
+        stop_motion()
+        return
+    end
+
+    mirror(locked_target)
+end)
